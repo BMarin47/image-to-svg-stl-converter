@@ -1,75 +1,183 @@
-entoimport tkinter as tk
+import tkinter as tk
 from tkinter import filedialog, messagebox
 import cv2
-import svgwrite
+import numpy as np
 import os
+import subprocess
 
-def convert_to_svg(image_path):
-    # 1. Load the image using OpenCV
-    img = cv2.imread(image_path)
+OPENSCAD_PATH = r"C:\Program Files\OpenSCAD\openscad.exe"
+EXTRUDE_HEIGHT = 5
+
+def load_mask(input_path):
+    img = cv2.imread(input_path, cv2.IMREAD_UNCHANGED)
+
     if img is None:
-        raise ValueError("Could not load image.")
+        raise Exception("No se pudo leer la imagen.")
 
-    # 2. Convert the image to grayscale
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Si tiene transparencia, usa el canal alpha
+    if len(img.shape) == 3 and img.shape[2] == 4:
+        alpha = img[:, :, 3]
+        mask = np.where(alpha > 20, 255, 0).astype(np.uint8)
+    else:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
 
-    # 3. Convert to black and white (binary)
-    # Using Otsu's thresholding to automatically find the best threshold
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        # Detecta automáticamente lo oscuro como figura
+        _, mask = cv2.threshold(
+            gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+        )
 
-    # 4. Find the main contours (outlines) of the black and white image
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Limpieza suave
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-    # Prepare SVG output path based on the original image name
-    base_name = os.path.splitext(os.path.basename(image_path))[0]
-    output_path = f"{base_name}_vectorized.svg"
+    return mask
 
-    # 5. Create SVG drawing
-    height, width = img.shape[:2]
-    dwg = svgwrite.Drawing(output_path, size=(width, height), profile='tiny')
-
-    # 6. Add contours as polygons to the SVG
-    for contour in contours:
-        # Convert contour points to SVG format
-        points = []
-        for point in contour:
-            x, y = point[0]
-            points.append((int(x), int(y)))
-        
-        # Only draw polygons with at least 3 points
-        if len(points) > 2:
-            dwg.add(dwg.polygon(points, fill='black'))
-
-    # Save the SVG file
-    dwg.save()
-    return output_path
-
-def select_image():
-    # Open a file dialog to select an image
-    file_path = filedialog.askopenfilename(
-        title="Select an Image",
-        filetypes=[("Image Files", "*.png;*.jpg;*.jpeg;*.bmp")]
+def find_contours_with_holes(mask):
+    contours, hierarchy = cv2.findContours(
+        mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE
     )
-    
-    if file_path:
-        try:
-            output_file = convert_to_svg(file_path)
-            messagebox.showinfo("Success", f"Converted successfully!\nSaved as: {output_file}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to convert image:\n{str(e)}")
 
-# --- Setup the User Interface ---
+    if hierarchy is None:
+        return [], None
+
+    return contours, hierarchy[0]
+
+def simplify_contour(cnt):
+    epsilon = 0.0015 * cv2.arcLength(cnt, True)
+    approx = cv2.approxPolyDP(cnt, epsilon, True)
+    return approx
+
+def contour_to_points(cnt):
+    points = []
+    for point in cnt:
+        x, y = point[0]
+        points.append(f"[{int(x)}, {-int(y)}]")
+    return ", ".join(points)
+
+def png_to_svg(contours, hierarchy, output_svg):
+    with open(output_svg, "w", encoding="utf-8") as f:
+        f.write('<svg xmlns="http://www.w3.org/2000/svg">\n')
+
+        for i, cnt in enumerate(contours):
+            area = cv2.contourArea(cnt)
+            if area < 30:
+                continue
+
+            cnt = simplify_contour(cnt)
+
+            path = "M "
+            for point in cnt:
+                x, y = point[0]
+                path += f"{int(x)},{int(y)} "
+            path += "Z"
+
+            f.write(f'<path d="{path}" fill="black"/>\n')
+
+        f.write("</svg>")
+
+def write_polygon(f, cnt, indent=""):
+    cnt = simplify_contour(cnt)
+
+    if len(cnt) < 3:
+        return
+
+    points = contour_to_points(cnt)
+    f.write(f"{indent}polygon(points=[{points}]);\n")
+
+def contours_to_scad(contours, hierarchy, scad_path):
+    with open(scad_path, "w", encoding="utf-8") as f:
+        f.write(f"linear_extrude(height = {EXTRUDE_HEIGHT}) {{\n")
+        f.write("    union() {\n")
+
+        for i, cnt in enumerate(contours):
+            area = cv2.contourArea(cnt)
+
+            if area < 30:
+                continue
+
+            parent = hierarchy[i][3]
+
+            # Solo procesar contornos principales
+            if parent != -1:
+                continue
+
+            child = hierarchy[i][2]
+
+            if child == -1:
+                write_polygon(f, cnt, "        ")
+            else:
+                f.write("        difference() {\n")
+                write_polygon(f, cnt, "            ")
+
+                while child != -1:
+                    if cv2.contourArea(contours[child]) > 30:
+                        write_polygon(f, contours[child], "            ")
+                    child = hierarchy[child][0]
+
+                f.write("        }\n")
+
+        f.write("    }\n")
+        f.write("}\n")
+
+def scad_to_stl(scad_path, stl_path):
+    result = subprocess.run(
+        [
+            OPENSCAD_PATH,
+            "-o",
+            os.path.abspath(stl_path),
+            os.path.abspath(scad_path)
+        ],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        print("STDOUT:", result.stdout)
+        print("STDERR:", result.stderr)
+        raise Exception(result.stderr if result.stderr else "OpenSCAD falló.")
+
+def process_image():
+    file_path = filedialog.askopenfilename(filetypes=[("PNG files", "*.png")])
+
+    if not file_path:
+        return
+
+    os.makedirs("output", exist_ok=True)
+    os.makedirs("temp", exist_ok=True)
+
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+
+    svg_path = f"output/{base_name}.svg"
+    scad_path = f"temp/{base_name}.scad"
+    stl_path = f"output/{base_name}.stl"
+
+    try:
+        mask = load_mask(file_path)
+        contours, hierarchy = find_contours_with_holes(mask)
+
+        if not contours:
+            raise Exception("No se detectaron formas válidas.")
+
+        png_to_svg(contours, hierarchy, svg_path)
+        contours_to_scad(contours, hierarchy, scad_path)
+        scad_to_stl(scad_path, stl_path)
+
+        messagebox.showinfo(
+            "Success",
+            f"Archivos generados correctamente:\n\n{svg_path}\n{stl_path}"
+        )
+
+    except Exception as e:
+        messagebox.showerror("Error", str(e))
+        print("ERROR:", e)
+
 root = tk.Tk()
-root.title("Image to SVG Converter")
-root.geometry("350x150")
+root.title("PNG to SVG to STL Converter")
 
-# Label with instructions
-label = tk.Label(root, text="Select a logo image to convert to SVG", pady=15, font=("Arial", 10))
-label.pack()
+label = tk.Label(root, text="Seleccioná un PNG para convertirlo a SVG y STL")
+label.pack(padx=20, pady=10)
 
-# Button to trigger the process
-button = tk.Button(root, text="Load Image & Convert", command=select_image, padx=10, pady=10)
-button.pack()
+btn = tk.Button(root, text="Load Image & Convert", command=process_image)
+btn.pack(padx=20, pady=20)
 
-# Start the application loop
 root.mainloop()
