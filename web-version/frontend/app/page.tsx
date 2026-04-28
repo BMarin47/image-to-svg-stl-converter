@@ -69,13 +69,19 @@ export default function Home() {
   const [filename, setFilename] = useState<string>("");
   const [colors, setColors] = useState<ColorRow[]>([]);
   const [presetName, setPresetName] = useState("Logo simple");
-  const [maxColors, setMaxColors] = useState(8);
+  const [maxColors, setMaxColors] = useState(4);
   const [alphaThreshold, setAlphaThreshold] = useState(8);
+  const [mergeTolerance, setMergeTolerance] = useState(18);
+  const [ignoreWhiteBackground, setIgnoreWhiteBackground] = useState(true);
   const [modelWidth, setModelWidth] = useState(100);
   const [baseThickness, setBaseThickness] = useState(0);
+  const [baseEnabled, setBaseEnabled] = useState(false);
+  const [reliefZOffset, setReliefZOffset] = useState(0);
+  const [reliefThickness, setReliefThickness] = useState(1);
   const [minArea, setMinArea] = useState(16);
   const [morphSize, setMorphSize] = useState(2);
   const [mirrorX, setMirrorX] = useState(false);
+  const [export3mf, setExport3mf] = useState(true);
   const [openscadPath, setOpenscadPath] = useState("C:\\Program Files\\OpenSCAD\\openscad.exe");
   const [downloadUrl, setDownloadUrl] = useState("");
   const [generatedFiles, setGeneratedFiles] = useState<string[]>([]);
@@ -93,12 +99,25 @@ export default function Home() {
     setPresetName(preset.name);
     setModelWidth(preset.model_width_mm);
     setBaseThickness(preset.base_thickness_mm);
+    setBaseEnabled(preset.base_thickness_mm > 0);
+    setReliefZOffset(preset.relief_z_offset_mm);
+    setReliefThickness(preset.relief_thickness_mm);
     setColors((rows) =>
       rows.map((row) => ({
         ...row,
         export: preset.export_background ? true : row.export_default,
         z_offset: preset.relief_z_offset_mm,
         thickness: preset.relief_thickness_mm
+      }))
+    );
+  }
+
+  function applyHeightsToColors() {
+    setColors((rows) =>
+      rows.map((row) => ({
+        ...row,
+        z_offset: reliefZOffset,
+        thickness: reliefThickness
       }))
     );
   }
@@ -139,7 +158,9 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           max_colors: maxColors,
-          alpha_threshold: alphaThreshold
+          alpha_threshold: alphaThreshold,
+          merge_tolerance: mergeTolerance,
+          ignore_white_background: ignoreWhiteBackground
         })
       });
       const data = await readJson(response);
@@ -147,8 +168,8 @@ export default function Home() {
         data.colors.map((color: any) => ({
           ...color,
           export: selectedPreset.export_background ? true : color.export_default,
-          z_offset: selectedPreset.relief_z_offset_mm,
-          thickness: selectedPreset.relief_thickness_mm
+          z_offset: reliefZOffset,
+          thickness: reliefThickness
         }))
       );
       setStatus(`Detectados ${data.colors.length} colores.`);
@@ -172,18 +193,19 @@ export default function Home() {
         body: JSON.stringify({
           preset_name: presetName,
           model_width_mm: modelWidth,
-          base_thickness_mm: baseThickness,
+          base_thickness_mm: baseEnabled ? baseThickness : 0,
           min_area_px: minArea,
           morph_size_px: morphSize,
           mirror_x: mirrorX,
           openscad_path: openscadPath,
+          export_3mf: export3mf,
           colors
         })
       });
       const data = await readJson(response);
       setDownloadUrl(`${API_BASE}${data.download_url}`);
       setGeneratedFiles(data.files);
-      setStatus(`Generados ${data.files.length} STL. Descarga el ZIP.`);
+      setStatus(`Generados ${data.files.length} archivos. Descarga el ZIP.`);
     } catch (caught) {
       setError(messageFrom(caught));
     } finally {
@@ -224,13 +246,24 @@ export default function Home() {
 
           <div className="fields">
             <div className="field">
-              <label>Colores max.</label>
+              <label>Colores AMS</label>
+              <select value={maxColors} onChange={(event) => setMaxColors(Number(event.target.value))}>
+                {[2, 3, 4, 5].map((count) => (
+                  <option key={count} value={count}>
+                    {count} colores
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="field">
+              <label>Tolerancia similares</label>
               <input
                 type="number"
-                min="1"
-                max="32"
-                value={maxColors}
-                onChange={(event) => setMaxColors(Number(event.target.value))}
+                min="0"
+                max="80"
+                step="1"
+                value={mergeTolerance}
+                onChange={(event) => setMergeTolerance(Number(event.target.value))}
               />
             </div>
             <div className="field">
@@ -243,6 +276,14 @@ export default function Home() {
                 onChange={(event) => setAlphaThreshold(Number(event.target.value))}
               />
             </div>
+            <label className="row checkField">
+              <input
+                type="checkbox"
+                checked={ignoreWhiteBackground}
+                onChange={(event) => setIgnoreWhiteBackground(event.target.checked)}
+              />
+              Ignorar fondo blanco externo
+            </label>
           </div>
 
           <button disabled={!jobId || busy} onClick={detectColors}>
@@ -286,6 +327,34 @@ export default function Home() {
                 onChange={(event) => setBaseThickness(Number(event.target.value))}
               />
             </div>
+            <label className="row checkField">
+              <input
+                type="checkbox"
+                checked={baseEnabled}
+                onChange={(event) => setBaseEnabled(event.target.checked)}
+              />
+              Generar base separada
+            </label>
+            <div className="field">
+              <label>Z colores mm</label>
+              <input
+                type="number"
+                min="0"
+                step="0.1"
+                value={reliefZOffset}
+                onChange={(event) => setReliefZOffset(Number(event.target.value))}
+              />
+            </div>
+            <div className="field">
+              <label>Altura colores mm</label>
+              <input
+                type="number"
+                min="0.01"
+                step="0.1"
+                value={reliefThickness}
+                onChange={(event) => setReliefThickness(Number(event.target.value))}
+              />
+            </div>
             <div className="field">
               <label>Área mínima px²</label>
               <input
@@ -315,11 +384,19 @@ export default function Home() {
             Mirror X
           </label>
 
+          <label className="row">
+            <input type="checkbox" checked={export3mf} onChange={(event) => setExport3mf(event.target.checked)} />
+            Generar 3MF armado
+          </label>
+
           <ColorTable colors={colors} onChange={setColors} />
 
           <div className="row">
             <button disabled={!jobId || colors.length === 0 || busy} onClick={generateStl}>
               Generar STL
+            </button>
+            <button className="secondary" type="button" onClick={applyHeightsToColors}>
+              Aplicar alturas
             </button>
             <button className="secondary" type="button" onClick={() => applyPreset(presetName)}>
               Aplicar preset a colores

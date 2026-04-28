@@ -8,6 +8,7 @@ import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Literal
+from xml.sax.saxutils import escape
 
 import cv2
 import numpy as np
@@ -21,8 +22,9 @@ TEMP_DIR = BASE_DIR / "temp"
 
 DEFAULT_OPENSCAD_PATH = r"C:\Program Files\OpenSCAD\openscad.exe"
 DEFAULT_MODEL_WIDTH_MM = 100.0
-DEFAULT_COLOR_COUNT = 8
+DEFAULT_COLOR_COUNT = 4
 DEFAULT_ALPHA_THRESHOLD = 8
+DEFAULT_MERGE_TOLERANCE = 18.0
 DEFAULT_MIN_AREA_PX = 16
 DEFAULT_MORPH_SIZE_PX = 2
 KMEANS_MAX_SAMPLE_PIXELS = 100_000
@@ -35,6 +37,7 @@ BASE_MODE_RECTANGLE = "rectangle"
 BASE_MODE_KEYRING = "keyring"
 
 Point = tuple[float, float]
+Point3D = tuple[float, float, float]
 FilledShape = tuple[list[Point], list[list[Point]]]
 
 
@@ -82,6 +85,7 @@ class GenerateSettings:
     mirror_x: bool
     openscad_path: str | None
     colors: list[ExportRequest]
+    export_3mf: bool = True
 
 
 PRODUCT_PRESETS = (
@@ -215,13 +219,17 @@ class WebConverter:
         job_id: str,
         max_colors: int = DEFAULT_COLOR_COUNT,
         alpha_threshold: int = DEFAULT_ALPHA_THRESHOLD,
+        merge_tolerance: float = DEFAULT_MERGE_TOLERANCE,
+        ignore_white_background: bool = True,
     ) -> dict:
         metadata = self.get_job_metadata(job_id)
         image_rgba = np.array(Image.open(metadata["image_path"]).convert("RGBA"))
         colors, labels_map, valid_mask = self._detect_colors(
             image_rgba,
-            max(1, int(max_colors)),
+            max(1, min(5, int(max_colors))),
             max(0, min(255, int(alpha_threshold))),
+            max(0.0, float(merge_tolerance)),
+            bool(ignore_white_background),
         )
 
         job_dir = self.job_dir(job_id)
@@ -231,7 +239,12 @@ class WebConverter:
         (job_dir / "colors.json").write_text(json.dumps(colors_json, indent=2), encoding="utf-8")
         (job_dir / "detect_settings.json").write_text(
             json.dumps(
-                {"max_colors": max_colors, "alpha_threshold": alpha_threshold},
+                {
+                    "max_colors": max_colors,
+                    "alpha_threshold": alpha_threshold,
+                    "merge_tolerance": merge_tolerance,
+                    "ignore_white_background": ignore_white_background,
+                },
                 indent=2,
             ),
             encoding="utf-8",
@@ -312,6 +325,7 @@ class WebConverter:
         generated: list[Path] = []
         base_path: Path | None = None
         color_paths: list[Path] = []
+        assembly_paths: list[Path] = []
 
         if preset.base_mode != BASE_MODE_NONE and settings.base_thickness_mm > 0:
             base_path = self._export_product_base(
@@ -329,6 +343,7 @@ class WebConverter:
                 settings.morph_size_px,
             )
             generated.append(base_path)
+            assembly_paths.append(base_path)
 
         antialias_assignments = self._build_antialias_assignments(
             settings.colors,
@@ -337,7 +352,8 @@ class WebConverter:
 
         for export_index, request in enumerate(settings.colors, start=1):
             hex_name = safe_hex_for_filename(request.hex_value)
-            base_name = f"color_{export_index:02d}_{hex_name}"
+            color_name = self._color_name_for_hex(request.hex_value)
+            base_name = f"logo_color_{export_index:02d}_{color_name}_{hex_name}"
             mask_path = temp_dir / f"{base_name}_mask.png"
             svg_path = temp_dir / f"{base_name}.svg"
             scad_path = temp_dir / f"{base_name}.scad"
@@ -366,6 +382,7 @@ class WebConverter:
             self._write_scad(scad_path, shapes, z_offset, request.thickness, pixel_to_mm)
             self._run_openscad(openscad_path, scad_path, stl_path)
             color_paths.append(stl_path)
+            assembly_paths.append(stl_path)
             generated.append(stl_path)
 
         if preset.base_mode == BASE_MODE_KEYRING and base_path is not None and color_paths:
@@ -374,6 +391,11 @@ class WebConverter:
             self._write_import_union_scad(complete_scad_path, [base_path, *color_paths])
             self._run_openscad(openscad_path, complete_scad_path, complete_path)
             generated.append(complete_path)
+
+        if settings.export_3mf and assembly_paths:
+            three_mf_path = output_dir / "logo_multicolor.3mf"
+            self._write_3mf_from_stls(three_mf_path, assembly_paths)
+            generated.append(three_mf_path)
 
         if not generated:
             raise RuntimeError("No se generó ningún STL. Marca al menos un color exportable.")
@@ -405,11 +427,18 @@ class WebConverter:
         image_rgba: np.ndarray,
         max_colors: int,
         alpha_threshold: int,
+        merge_tolerance: float,
+        ignore_white_background: bool,
     ) -> tuple[list[DetectedColor], np.ndarray, np.ndarray]:
         height, width = image_rgba.shape[:2]
         rgb = image_rgba[:, :, :3].astype(np.uint8)
         alpha = image_rgba[:, :, 3]
         valid_mask = alpha > alpha_threshold
+        if ignore_white_background:
+            valid_mask = np.logical_and(
+                valid_mask,
+                np.logical_not(self._border_connected_white_mask(rgb, valid_mask)),
+            )
         if not np.any(valid_mask):
             raise RuntimeError("La imagen no tiene píxeles visibles con el alpha configurado.")
 
@@ -420,6 +449,13 @@ class WebConverter:
             centers_rgb = [tuple(int(v) for v in row) for row in unique_rgb]
         else:
             labels_valid, centers_rgb = self._kmeans_labels(rgb, valid_mask, max_colors)
+
+        labels_valid, centers_rgb = self._merge_similar_color_clusters(
+            labels_valid,
+            centers_rgb,
+            valid_rgb,
+            merge_tolerance,
+        )
 
         labels_map = np.full((height, width), -1, dtype=np.int32)
         labels_map[valid_mask] = labels_valid
@@ -448,7 +484,7 @@ class WebConverter:
                 self._is_neutral_gray(center_rgb)
                 and not self._is_near_white(center_rgb)
                 and not self._is_near_black(center_rgb)
-                and visible_fraction < 0.01
+                and visible_fraction < 0.05
             )
 
             note_parts = [f"{pixel_count} px"]
@@ -530,6 +566,117 @@ class WebConverter:
             start = end
         return labels
 
+    def _merge_similar_color_clusters(
+        self,
+        labels_valid: np.ndarray,
+        centers_rgb: list[tuple[int, int, int]],
+        valid_rgb: np.ndarray,
+        merge_tolerance: float,
+    ) -> tuple[np.ndarray, list[tuple[int, int, int]]]:
+        if merge_tolerance <= 0 or len(centers_rgb) <= 1:
+            return labels_valid, centers_rgb
+
+        centers_array = np.array(centers_rgb, dtype=np.uint8).reshape(1, -1, 3)
+        centers_lab = cv2.cvtColor(centers_array, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+        parent = list(range(len(centers_rgb)))
+
+        def find(index: int) -> int:
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        def union(first: int, second: int) -> None:
+            first_root = find(first)
+            second_root = find(second)
+            if first_root != second_root:
+                parent[second_root] = first_root
+
+        for first in range(len(centers_rgb)):
+            for second in range(first + 1, len(centers_rgb)):
+                distance = float(np.linalg.norm(centers_lab[first] - centers_lab[second]))
+                if distance <= merge_tolerance:
+                    union(first, second)
+
+        root_to_labels: dict[int, list[int]] = {}
+        for label_id in range(len(centers_rgb)):
+            root_to_labels.setdefault(find(label_id), []).append(label_id)
+
+        if len(root_to_labels) == len(centers_rgb):
+            return labels_valid, centers_rgb
+
+        ordered_groups = sorted(
+            root_to_labels.values(),
+            key=lambda group: sum(int(np.count_nonzero(labels_valid == label_id)) for label_id in group),
+            reverse=True,
+        )
+        old_to_new: dict[int, int] = {}
+        new_centers: list[tuple[int, int, int]] = []
+        for new_label, group in enumerate(ordered_groups):
+            for old_label in group:
+                old_to_new[old_label] = new_label
+            group_mask = np.isin(labels_valid, group)
+            cluster_rgb = valid_rgb[group_mask]
+            median = np.median(cluster_rgb, axis=0)
+            new_centers.append(tuple(int(v) for v in np.clip(np.round(median), 0, 255)))
+
+        remapped = np.array([old_to_new[int(label)] for label in labels_valid], dtype=np.int32)
+        return remapped, new_centers
+
+    def _border_connected_white_mask(self, rgb: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+        near_white = np.logical_and(valid_mask, np.all(rgb >= 235, axis=2)).astype(np.uint8)
+        if np.count_nonzero(near_white) == 0:
+            return np.zeros(valid_mask.shape, dtype=bool)
+
+        count, component_map, stats, _centroids = cv2.connectedComponentsWithStats(
+            near_white,
+            connectivity=8,
+        )
+        y_values, x_values = np.nonzero(valid_mask)
+        if len(x_values) == 0 or len(y_values) == 0:
+            return np.zeros(valid_mask.shape, dtype=bool)
+
+        visible_left = int(x_values.min())
+        visible_right = int(x_values.max())
+        visible_top = int(y_values.min())
+        visible_bottom = int(y_values.max())
+        visible_width = max(1, visible_right - visible_left + 1)
+        visible_height = max(1, visible_bottom - visible_top + 1)
+        visible_area = max(1, int(np.count_nonzero(valid_mask)))
+
+        background = np.zeros(valid_mask.shape, dtype=bool)
+        for component_id in range(1, count):
+            left = int(stats[component_id, cv2.CC_STAT_LEFT])
+            top = int(stats[component_id, cv2.CC_STAT_TOP])
+            width = int(stats[component_id, cv2.CC_STAT_WIDTH])
+            height = int(stats[component_id, cv2.CC_STAT_HEIGHT])
+            area = int(stats[component_id, cv2.CC_STAT_AREA])
+            right = left + width - 1
+            bottom = top + height - 1
+
+            touches_image_border = (
+                left <= 1
+                or top <= 1
+                or right >= valid_mask.shape[1] - 2
+                or bottom >= valid_mask.shape[0] - 2
+            )
+            touches_visible_border = (
+                left <= visible_left + 1
+                or top <= visible_top + 1
+                or right >= visible_right - 1
+                or bottom >= visible_bottom - 1
+            )
+            large_background_plate = (
+                area / visible_area >= 0.08
+                and width / visible_width >= 0.55
+                and height / visible_height >= 0.55
+            )
+
+            if touches_image_border or (touches_visible_border and large_background_plate):
+                background[component_map == component_id] = True
+
+        return background
+
     def _is_near_white(self, rgb: tuple[int, int, int]) -> bool:
         return rgb[0] >= 245 and rgb[1] >= 245 and rgb[2] >= 245
 
@@ -540,7 +687,7 @@ class WebConverter:
         return max(rgb) - min(rgb) <= 12
 
     def _is_probable_antialias_color(self, color: DetectedColor) -> bool:
-        if color.visible_fraction >= 0.01:
+        if color.visible_fraction >= 0.05:
             return False
         if self._is_near_white(color.rgb) or self._is_near_black(color.rgb):
             return False
@@ -577,6 +724,41 @@ class WebConverter:
     def _hex_to_rgb(self, hex_value: str) -> tuple[int, int, int]:
         value = hex_value.strip().lstrip("#")
         return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+    def _color_name_for_hex(self, hex_value: str) -> str:
+        return self._color_name_for_rgb(self._hex_to_rgb(hex_value))
+
+    def _color_name_for_rgb(self, rgb: tuple[int, int, int]) -> str:
+        red, green, blue = rgb
+        maximum = max(rgb)
+        minimum = min(rgb)
+        if maximum <= 35:
+            return "negro"
+        if minimum >= 225:
+            return "blanco"
+        if maximum - minimum <= 22:
+            return "gris"
+        hsv = cv2.cvtColor(np.array([[[red, green, blue]]], dtype=np.uint8), cv2.COLOR_RGB2HSV)[0, 0]
+        hue = int(hsv[0]) * 2
+        saturation = int(hsv[1])
+        value = int(hsv[2])
+        if saturation < 40:
+            return "gris_claro" if value > 145 else "gris_oscuro"
+        if hue < 18 or hue >= 345:
+            return "rojo"
+        if hue < 45:
+            return "naranja"
+        if hue < 72:
+            return "amarillo"
+        if hue < 165:
+            return "verde"
+        if hue < 195:
+            return "cyan"
+        if hue < 255:
+            return "azul"
+        if hue < 290:
+            return "violeta"
+        return "magenta"
 
     def _build_clean_mask(
         self,
@@ -668,10 +850,14 @@ class WebConverter:
     def _select_base_color(self, detected_colors: list[DetectedColor]) -> DetectedColor | None:
         if not detected_colors:
             return None
-        background_candidates = [color for color in detected_colors if not color.export_default]
+        background_candidates = [
+            color
+            for color in detected_colors
+            if not color.export_default and self._is_near_white(color.rgb)
+        ]
         if background_candidates:
             return max(background_candidates, key=lambda color: color.pixel_count)
-        return max(detected_colors, key=lambda color: color.pixel_count)
+        return None
 
     def _build_base_reference_mask(
         self,
@@ -1048,6 +1234,104 @@ class WebConverter:
     def _scad_path(self, path: Path) -> str:
         return str(path.resolve()).replace("\\", "/").replace('"', '\\"')
 
+    def _write_3mf_from_stls(self, three_mf_path: Path, stl_paths: list[Path]) -> None:
+        objects_xml: list[str] = []
+        items_xml: list[str] = []
+        for object_id, stl_path in enumerate(stl_paths, start=1):
+            triangles = self._read_ascii_stl_triangles(stl_path)
+            if not triangles:
+                continue
+
+            vertices_xml: list[str] = []
+            triangles_xml: list[str] = []
+            vertex_index = 0
+            for triangle in triangles:
+                indices: list[int] = []
+                for x_value, y_value, z_value in triangle:
+                    vertices_xml.append(
+                        "          "
+                        f'<vertex x="{self._xml_float(x_value)}" '
+                        f'y="{self._xml_float(y_value)}" '
+                        f'z="{self._xml_float(z_value)}" />'
+                    )
+                    indices.append(vertex_index)
+                    vertex_index += 1
+                triangles_xml.append(
+                    "          "
+                    f'<triangle v1="{indices[0]}" v2="{indices[1]}" v3="{indices[2]}" />'
+                )
+
+            object_name = escape(stl_path.stem)
+            objects_xml.append(
+                f'    <object id="{object_id}" type="model" name="{object_name}">\n'
+                "      <mesh>\n"
+                "        <vertices>\n"
+                + "\n".join(vertices_xml)
+                + "\n        </vertices>\n"
+                "        <triangles>\n"
+                + "\n".join(triangles_xml)
+                + "\n        </triangles>\n"
+                "      </mesh>\n"
+                "    </object>"
+            )
+            items_xml.append(f'    <item objectid="{object_id}" />')
+
+        if not objects_xml:
+            raise RuntimeError("No se pudo crear el 3MF porque los STL no contienen triangulos.")
+
+        model_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<model unit="millimeter" xml:lang="es-AR" '
+            'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">\n'
+            "  <metadata name=\"Title\">logo_multicolor</metadata>\n"
+            "  <resources>\n"
+            + "\n".join(objects_xml)
+            + "\n  </resources>\n"
+            "  <build>\n"
+            + "\n".join(items_xml)
+            + "\n  </build>\n"
+            "</model>\n"
+        )
+
+        content_types = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">\n'
+            '  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml" />\n'
+            '  <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml" />\n'
+            "</Types>\n"
+        )
+        relationships = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\n'
+            '  <Relationship Target="/3D/3dmodel.model" Id="rel0" '
+            'Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel" />\n'
+            "</Relationships>\n"
+        )
+
+        with zipfile.ZipFile(three_mf_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("[Content_Types].xml", content_types)
+            archive.writestr("_rels/.rels", relationships)
+            archive.writestr("3D/3dmodel.model", model_xml)
+
+    def _read_ascii_stl_triangles(self, stl_path: Path) -> list[list[Point3D]]:
+        triangles: list[list[Point3D]] = []
+        current: list[Point3D] = []
+        for raw_line in stl_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw_line.strip()
+            if not line.startswith("vertex "):
+                continue
+            parts = line.split()
+            if len(parts) != 4:
+                continue
+            current.append((float(parts[1]), float(parts[2]), float(parts[3])))
+            if len(current) == 3:
+                triangles.append(current)
+                current = []
+        return triangles
+
+    def _xml_float(self, value: float) -> str:
+        return f"{value:.6f}".rstrip("0").rstrip(".")
+
     def _run_openscad(self, openscad_path: Path, scad_path: Path, stl_path: Path) -> None:
         result = subprocess.run(
             [str(openscad_path), "-o", str(stl_path), str(scad_path)],
@@ -1086,6 +1370,12 @@ class WebConverter:
         preset: ProductPreset,
     ) -> str:
         names = "\n".join(f"- {path.name}" for path in generated)
+        has_3mf = any(path.suffix.lower() == ".3mf" for path in generated)
+        three_mf_note = (
+            "- logo_multicolor.3mf incluye las partes alineadas para abrirlas juntas.\n"
+            if has_3mf
+            else ""
+        )
         keyring_note = ""
         bambu_note = (
             "- En Bambu Studio importa todos los STL juntos.\n"
@@ -1109,6 +1399,7 @@ class WebConverter:
             "Importante:\n"
             "- STL no guarda colores.\n"
             "- Cada STL representa un color/material.\n"
+            f"{three_mf_note}"
             f"{keyring_note}"
             f"{bambu_note}"
             "- Todos comparten el mismo canvas, origen y escala.\n"

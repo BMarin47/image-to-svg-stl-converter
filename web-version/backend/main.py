@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from converter import (
     DEFAULT_ALPHA_THRESHOLD,
     DEFAULT_COLOR_COUNT,
+    DEFAULT_MERGE_TOLERANCE,
     DEFAULT_MIN_AREA_PX,
     DEFAULT_MODEL_WIDTH_MM,
     DEFAULT_MORPH_SIZE_PX,
@@ -26,8 +27,10 @@ from converter import (
 
 
 class DetectRequest(BaseModel):
-    max_colors: int = Field(default=DEFAULT_COLOR_COUNT, ge=1, le=32)
+    max_colors: int = Field(default=DEFAULT_COLOR_COUNT, ge=2, le=5)
     alpha_threshold: int = Field(default=DEFAULT_ALPHA_THRESHOLD, ge=0, le=255)
+    merge_tolerance: float = Field(default=DEFAULT_MERGE_TOLERANCE, ge=0, le=80)
+    ignore_white_background: bool = True
 
 
 class GenerateColorRequest(BaseModel):
@@ -46,6 +49,7 @@ class GenerateRequest(BaseModel):
     morph_size_px: int = Field(default=DEFAULT_MORPH_SIZE_PX, ge=0)
     mirror_x: bool = False
     openscad_path: str | None = None
+    export_3mf: bool = True
     colors: list[GenerateColorRequest]
 
 
@@ -115,6 +119,8 @@ def detect(job_id: str, request: DetectRequest) -> dict:
             job_id,
             max_colors=request.max_colors,
             alpha_threshold=request.alpha_threshold,
+            merge_tolerance=request.merge_tolerance,
+            ignore_white_background=request.ignore_white_background,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -150,6 +156,7 @@ def generate(job_id: str, request: GenerateRequest) -> dict:
         mirror_x=request.mirror_x,
         openscad_path=openscad_path,
         colors=selected_colors,
+        export_3mf=request.export_3mf,
     )
 
     try:

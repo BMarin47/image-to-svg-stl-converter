@@ -314,6 +314,16 @@ label {
   gap: 6px;
 }
 
+.checkField {
+  min-height: 40px;
+  align-self: end;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-strong);
+  color: var(--text);
+}
+
 .preview {
   width: 100%;
   max-height: 330px;
